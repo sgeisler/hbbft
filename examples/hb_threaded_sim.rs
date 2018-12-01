@@ -4,6 +4,7 @@
 extern crate bincode;
 extern crate hbbft;
 extern crate rand;
+extern crate structopt;
 
 use hbbft::{NetworkInfo, Target};
 use hbbft::dynamic_honey_badger::{DynamicHoneyBadgerBuilder, Message};
@@ -13,27 +14,39 @@ use hbbft::queueing_honey_badger::*;
 use rand::{OsRng, Rng, thread_rng};
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{JoinHandle, sleep, spawn};
 use std::time::{Duration, Instant, SystemTime};
 
+use structopt::StructOpt;
 
 type Transaction = Vec<u8>;
 type NodeId = usize;
 
-const NODES: usize = 10;
-const NODES_ROGUE: &[NodeId] = &[0];
-
-const TX_SIZE: usize = 500;
-const TX_COUNT: usize = 40000;
-const MAX_BLOCK_SIZE: usize = 2000;
-
-const NETWORK_DELAY_MS: u64 = 400;
-const NETWORK_DELAY_TOLERANCE_MS: u64 = 5;
-
 const ENCRYPTION_SCHEDULE: EncryptionSchedule = EncryptionSchedule::Always;
 const SUBSET_STRATEGY: SubsetHandlingStrategy = SubsetHandlingStrategy::AllAtEnd;
+
+#[derive(Clone, Debug, StructOpt)]
+#[structopt(name = "hb_threaded_sim", about = "Multi threaded simulation of a HBBFT network.")]
+pub struct Config {
+    #[structopt(short = "n", long = "node-count", default_value = "10")]
+    nodes: usize,
+
+    #[structopt(short = "r", long = "rogue-node-count", default_value = "2")]
+    rogue: usize,
+
+    #[structopt(short = "s", long = "tx-size", default_value = "500")]
+    tx_size: usize,
+
+    #[structopt(short = "b", long = "tx-per-block", default_value = "2000")]
+    tx_per_block: usize,
+
+    #[structopt(short = "m", long = "mempool-size", default_value = "20000")]
+    mempool_size: usize,
+
+    #[structopt(short = "l", long = "network-latency-ms", default_value = "500")]
+    latency: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct DelayedMessage {
@@ -49,6 +62,7 @@ pub struct SimNode {
     hb: QueueingHoneyBadger<Transaction, NodeId, Vec<Transaction>>,
     send_socket: Sender<DelayedMessage>,
     receive_socket: Receiver<DelayedMessage>,
+    config: Config,
 }
 
 #[derive(Debug)]
@@ -56,8 +70,8 @@ pub struct SimNet {
     send_sockets: Vec<Sender<DelayedMessage>>,
     receive_socket: Receiver<DelayedMessage>,
     running_nodes: Vec<JoinHandle<()>>,
-    network_delay: Duration,
-    network_counter: BTreeMap<NodeId, (usize, usize)>
+    network_counter: BTreeMap<NodeId, (usize, usize)>,
+    config: Config,
 }
 
 
@@ -65,8 +79,10 @@ pub fn unix_timestamp() -> f64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_float_secs()
 }
 
-pub fn is_rogue(node_id: &NodeId) -> bool {
-    NODES_ROGUE.iter().any(|node| node == node_id)
+impl Config {
+    pub fn is_rogue(&self, node_id: &NodeId) -> bool {
+        *node_id < self.rogue
+    }
 }
 
 impl SimNode {
@@ -74,7 +90,8 @@ impl SimNode {
         network_info: NetworkInfo<NodeId>,
         send_socket: Sender<DelayedMessage>,
         receive_socket: Receiver<DelayedMessage>,
-        mempool: Vec<Transaction>
+        mempool: Vec<Transaction>,
+        cfg: Config,
     ) -> SimNode {
         let id = network_info.our_id().clone();
 
@@ -84,7 +101,7 @@ impl SimNode {
             .build(network_info);
 
         let (qhb, first_step) = QueueingHoneyBadgerBuilder::new(dhb)
-            .batch_size(MAX_BLOCK_SIZE)
+            .batch_size(cfg.tx_per_block)
             .queue(mempool)
             .build(OsRng::new().unwrap());
 
@@ -93,6 +110,7 @@ impl SimNode {
             hb: qhb,
             send_socket,
             receive_socket,
+            config: cfg,
         };
         node.do_step(first_step);
         node
@@ -127,30 +145,30 @@ impl SimNode {
                 sender: self.id(),
                 message: msg.message
             };
-            self.send_socket.send(wire_msg);
+            self.send_socket.send(wire_msg).unwrap();
         }
     }
 }
 
 impl SimNet {
-    pub fn new() -> SimNet {
+    pub fn new(cfg: Config) -> SimNet {
         println!("Starting SimNet");
         let (node_send, remote_receive) = channel::<DelayedMessage>();
 
         let mut rng = OsRng::new().unwrap();
 
         println!("Generating mempool");
-        let mempool = (0..TX_COUNT).into_iter()
-            .map(|_| rng.gen_iter().take(TX_SIZE).collect())
+        let mempool = (0..cfg.mempool_size).into_iter()
+            .map(|_| rng.gen_iter().take(cfg.tx_size).collect())
             .collect::<Vec<_>>();
 
         println!("Generating nodes");
-        let network_infos = NetworkInfo::generate_map(0..NODES, &mut rng).unwrap();
+        let network_infos = NetworkInfo::generate_map(0..cfg.nodes, &mut rng).unwrap();
         let (nodes, channels): (Vec<_>, Vec<_>) = network_infos
             .into_iter()
             .map(|(_, network_info)| {
                 let (remote_send, node_receive) = channel::<DelayedMessage>();
-                (SimNode::new(network_info, node_send.clone(), node_receive, mempool.clone()), remote_send)
+                (SimNode::new(network_info, node_send.clone(), node_receive, mempool.clone(), cfg.clone()), remote_send)
             })
             .unzip();
 
@@ -168,19 +186,19 @@ impl SimNet {
             send_sockets: channels,
             receive_socket: remote_receive,
             running_nodes: threads,
-            network_delay: Duration::from_millis(NETWORK_DELAY_MS),
-            network_counter: (0..NODES).into_iter().map(|id| (id, (0, 0))).collect(),
+            network_counter: (0..cfg.nodes).into_iter().map(|id| (id, (0, 0))).collect(),
+            config: cfg,
         }
     }
 
     pub fn dispatch_messages(&mut self) {
         let mut rng = thread_rng();
-        let mut start_time = Instant::now();
+        let start_time = Instant::now();
         let mut last_report_time = Instant::now();
 
         while let Ok(msg) = self.receive_socket.recv() {
             // simulate rogue nodes
-            if is_rogue(&msg.sender) && rng.gen_weighted_bool(2) {
+            if self.config.is_rogue(&msg.sender) && rng.gen_weighted_bool(2) {
                 continue;
             }
 
@@ -189,8 +207,8 @@ impl SimNet {
 
             // simulate network latency
             let since_sent = msg.send_time.elapsed();
-            let target_delay = Duration::from_millis(NETWORK_DELAY_MS);
-            if since_sent < target_delay && (target_delay - since_sent) > Duration::from_millis(NETWORK_DELAY_TOLERANCE_MS) {
+            let target_delay = Duration::from_millis(self.config.latency);
+            if since_sent < target_delay {
                 sleep(target_delay - since_sent)
             }
 
@@ -198,12 +216,12 @@ impl SimNet {
                 Target::All => {
                     for (id, node_socket) in self.send_sockets.iter_mut().enumerate() {
                         self.network_counter.get_mut(&id).map(|x| x.1 += msg_len);
-                        node_socket.send(msg.clone());
+                        node_socket.send(msg.clone()).unwrap();
                     }
                 },
                 Target::Node(receiver) => {
                     self.network_counter.get_mut(&receiver).map(|x| x.1 += msg_len);
-                    self.send_sockets[receiver].send(msg);
+                    self.send_sockets[receiver].send(msg).unwrap();
                 },
             }
 
@@ -224,6 +242,8 @@ impl SimNet {
 }
 
 fn main() {
-    let mut net = SimNet::new();
+    let config = Config::from_args();
+
+    let mut net = SimNet::new(config);
     net.dispatch_messages();
 }

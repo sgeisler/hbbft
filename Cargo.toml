@@ -50,6 +50,7 @@ proptest = "0.8.7"
 #       appears.
 rand_core = "0.2.1"
 integer-sqrt = "0.1.1"
+structopt = "0.2.13"
 
 [[example]]
 name = "consensus-node"
