@@ -24,8 +24,6 @@ type NodeId = usize;
 
 const NODES: usize = 10;
 const NODES_ROGUE: &[NodeId] = &[0];
-const NODES_JOIN_LATER: &[NodeId] = &[1];
-const JOIN_DELAY_SECS: u64 = 15;
 
 const TX_SIZE: usize = 500;
 const TX_COUNT: usize = 40000;
@@ -69,10 +67,6 @@ pub fn unix_timestamp() -> f64 {
 
 pub fn is_rogue(node_id: &NodeId) -> bool {
     NODES_ROGUE.iter().any(|node| node == node_id)
-}
-
-pub fn is_joining_late(node_id: &NodeId) -> bool {
-    NODES_JOIN_LATER.iter().any(|node| node == node_id)
 }
 
 impl SimNode {
@@ -164,11 +158,6 @@ impl SimNet {
             .map(|node| {
                 spawn(move || {
                     let mut node: SimNode = node;
-
-                    if is_joining_late(&node.id()) {
-                        sleep(Duration::from_secs(JOIN_DELAY_SECS + 1));
-                    }
-
                     println!("{} spawning node {}", unix_timestamp(), node.id());
                     node.run();
                 })
@@ -190,9 +179,8 @@ impl SimNet {
         let mut last_report_time = Instant::now();
 
         while let Ok(msg) = self.receive_socket.recv() {
-            // simulate rogue nodes and late joiners
-            if (is_rogue(&msg.sender) && rng.gen_weighted_bool(2)) ||
-               (is_joining_late(&msg.sender) && start_time.elapsed() < Duration::from_secs(JOIN_DELAY_SECS)) {
+            // simulate rogue nodes
+            if is_rogue(&msg.sender) && rng.gen_weighted_bool(2) {
                 continue;
             }
 
@@ -209,18 +197,13 @@ impl SimNet {
             match msg.receiver.clone() {
                 Target::All => {
                     for (id, node_socket) in self.send_sockets.iter_mut().enumerate() {
-                        if is_joining_late(&id) && start_time.elapsed() < Duration::from_secs(JOIN_DELAY_SECS) {
-                            continue;
-                        }
                         self.network_counter.get_mut(&id).map(|x| x.1 += msg_len);
                         node_socket.send(msg.clone());
                     }
                 },
                 Target::Node(receiver) => {
-                    if !(is_joining_late(&receiver) && start_time.elapsed() < Duration::from_secs(JOIN_DELAY_SECS)) {
-                        self.network_counter.get_mut(&receiver).map(|x| x.1 += msg_len);
-                        self.send_sockets[receiver].send(msg);
-                    }
+                    self.network_counter.get_mut(&receiver).map(|x| x.1 += msg_len);
+                    self.send_sockets[receiver].send(msg);
                 },
             }
 
