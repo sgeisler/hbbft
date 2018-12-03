@@ -46,6 +46,9 @@ pub struct Config {
 
     #[structopt(short = "l", long = "network-latency-ms", default_value = "500")]
     latency: u64,
+
+    #[structopt(long = "broadcast-only")]
+    broadcast_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -203,7 +206,7 @@ impl SimNet {
             }
 
             let msg_len = bincode::serialize(&msg.message).unwrap().len();
-            self.network_counter.get_mut(&msg.sender).map(|x| x.0 += msg_len);
+            let node_count = self.config.nodes;
 
             // simulate network latency
             let since_sent = msg.send_time.elapsed();
@@ -214,13 +217,20 @@ impl SimNet {
 
             match msg.receiver.clone() {
                 Target::All => {
+                    self.network_counter.get_mut(&msg.sender).map(|x| x.0 += msg_len * node_count);
                     for (id, node_socket) in self.send_sockets.iter_mut().enumerate() {
                         self.network_counter.get_mut(&id).map(|x| x.1 += msg_len);
                         node_socket.send(msg.clone()).unwrap();
                     }
                 },
                 Target::Node(receiver) => {
-                    self.network_counter.get_mut(&receiver).map(|x| x.1 += msg_len);
+                    if self.config.broadcast_only {
+                        self.network_counter.get_mut(&msg.sender).map(|x| x.0 += msg_len * node_count);
+                        self.network_counter.get_mut(&receiver).map(|x| x.1 += msg_len * node_count);
+                    } else {
+                        self.network_counter.get_mut(&msg.sender).map(|x| x.0 += msg_len);
+                        self.network_counter.get_mut(&receiver).map(|x| x.1 += msg_len);
+                    }
                     self.send_sockets[receiver].send(msg).unwrap();
                 },
             }
